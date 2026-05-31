@@ -331,9 +331,9 @@ def _fused_moe_gguf(
         ops.moe_sum(out, out_hidden_states)
     else:
         logger.warning_once(
-            "There is no support for fast MoE kernel "
-            "for current quantization method. "
-            "Falling back to slow implementation. "
+            "No fast MoE kernel for I-Matrix (imatrix) quantization types. "
+            "Falling back to per-token loop (slow but correct). "
+            "Use K-quant (Q4_K_M, Q6_K, etc.) for faster MoE inference."
         )
         for tok, (w, idx) in enumerate(zip(topk_weights, topk_ids)):
             inp = x[tok].reshape((1,) + x.shape[1:])
