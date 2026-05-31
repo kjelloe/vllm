@@ -14,7 +14,7 @@
 vLLM supports GGUF loading for the following model families:
 
 | Type | Examples |
-|------|---------|
+| ---- | ------- |
 | Dense | LLaMA, Qwen2/3, Phi-3, GPT-2, Mistral, Gemma, StableLM |
 | MoE | DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Qwen3.5-MoE, MiniMax-M2 |
 | Multimodal | Gemma3 (requires a companion `mmproj-*.gguf` file in the same directory) |
@@ -54,6 +54,18 @@ vllm serve unsloth/Qwen3-0.6B-GGUF:Q4_K_M \
    --tokenizer Qwen/Qwen3-0.6B \
    --hf-config-path Qwen/Qwen3-0.6B
 ```
+
+!!! note "Qwen3.5-MoE always requires --hf-config-path"
+    The `qwen35moe` architecture identifier used in GGUF files is not recognized by
+    HuggingFace's config parser. You must pass `--hf-config-path` pointing to the
+    HuggingFace model to load Qwen3.5-MoE GGUF models:
+
+    ```bash
+    vllm serve ./Qwen3.5-35B-A3B-Q4_K_M.gguf \
+       --tokenizer Qwen/Qwen3.5-35B-A3B \
+       --hf-config-path Qwen/Qwen3.5-35B-A3B \
+       --tensor-parallel-size 2
+    ```
 
 You can also use the GGUF model directly through the LLM entrypoint:
 

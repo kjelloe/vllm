@@ -503,7 +503,7 @@ class GGUFModelLoader(BaseModelLoader):
         all_extra_names = []
         for f in gguf_files:
             all_extra_names.extend(get_gguf_extra_tensor_names(f, gguf_weights_map))
-        if "lm_head.weight" in all_extra_names:
+        if any("lm_head.weight" in n for n in all_extra_names):
             model_config.hf_config.update({"tie_word_embeddings": True})
 
         weight_type_map = self._get_gguf_weight_type(
