@@ -121,8 +121,13 @@ class GGUFModelLoader(BaseModelLoader):
         # models, this returns config itself.
         text_config = config.get_text_config()
         model_type = config.model_type
+        # Require vision_config to have num_hidden_layers: some configs
+        # (e.g. Qwen3_5MoeConfig) always create a vision_config even for
+        # text-only models, using 'depth' instead of 'num_hidden_layers'.
         is_multimodal = (
-            hasattr(config, "vision_config") and config.vision_config is not None
+            hasattr(config, "vision_config")
+            and config.vision_config is not None
+            and hasattr(config.vision_config, "num_hidden_layers")
         )
         gguf_to_hf_name_map = {}
         sideload_params: list[re.Pattern] = []
@@ -176,6 +181,42 @@ class GGUFModelLoader(BaseModelLoader):
                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                     )
                 )
+        is_qwen35moe = model_type == "qwen3_5_moe"
+        if is_qwen35moe:
+            model_type = "qwen35moe"
+            # Qwen3_5MoeConfig always instantiates vision_config even for
+            # text-only models, so is_multimodal is incorrectly True above.
+            # Override here so text GGUF loading does not look for an mmproj.
+            is_multimodal = False
+            # GGUF stores all routed expert weights as merged tensors
+            # (blk.N.ffn_*_exps); map them manually like qwen3_moe.
+            # Also map SSM dt_bias: gguf-py maps dt_proj→ssm_dt but not
+            # the standalone dt_bias, stored as blk.N.ssm_dt.bias in GGUF.
+            layer_types = getattr(
+                text_config,
+                "layer_types",
+                ["linear_attention"] * text_config.num_hidden_layers,
+            )
+            for idx in range(text_config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                )
+                sideload_params.append(
+                    re.compile(
+                        f"model\\.layers\\.{idx}"
+                        r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
+                    )
+                )
+                if layer_types[idx] == "linear_attention":
+                    gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
+                        f"model.layers.{idx}.linear_attn.dt_bias"
+                    )
         if model_type == "minimax_m2":
             model_type = "minimax-m2"
             # GGUF layer map assumes merged expert weights
@@ -224,9 +265,13 @@ class GGUFModelLoader(BaseModelLoader):
         auto_cls = (
             AutoModelForImageTextToText if is_multimodal else AutoModelForCausalLM
         )
+        # Qwen3_5MoeConfig is a multimodal wrapper whose text model expects
+        # text_config directly (model_type "qwen3_5_moe_text"). Passing the
+        # outer config causes AttributeError: no 'vocab_size'.
+        config_for_dummy = text_config if model_type == "qwen35moe" else config
         with torch.device("meta"):
             dummy_model = auto_cls.from_config(
-                config, trust_remote_code=model_config.trust_remote_code
+                config_for_dummy, trust_remote_code=model_config.trust_remote_code
             )
 
         state_dict = dummy_model.state_dict()
@@ -312,7 +357,12 @@ class GGUFModelLoader(BaseModelLoader):
             if gguf_name is None:
                 return None
 
-            return gguf_name + "." + suffix
+            # Some parameters (e.g. A_log / ssm_a) have no .weight/.bias
+            # suffix in either the HF name or the GGUF tensor name.  Avoid
+            # producing a trailing dot when suffix is empty.
+            if suffix:
+                return gguf_name + "." + suffix
+            return gguf_name
 
         # Build mapping and track unmapped parameters
         unmapped_params = []
@@ -342,6 +392,19 @@ class GGUFModelLoader(BaseModelLoader):
                 f"({len(unmapped_params)}): "
                 f"{unmapped_params}"
             )
+        # vLLM's Qwen3_5MoeForConditionalGeneration is always a multimodal
+        # wrapper with sub-modules visual.* and language_model.*. Its
+        # hf_to_vllm_mapper expects "model.language_model." as the prefix for
+        # language-model weights. The dummy text model used for name discovery
+        # above produces plain "model.*" names; fix them here so the mapper
+        # can route them correctly.
+        if is_qwen35moe:
+            gguf_to_hf_name_map = {
+                k: "model.language_model." + v[len("model.") :]
+                if v.startswith("model.")
+                else v
+                for k, v in gguf_to_hf_name_map.items()
+            }
         return gguf_to_hf_name_map
 
     def _get_gguf_weight_type(
@@ -354,12 +417,20 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = {}
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
-        is_multimodal = hasattr(model_config.hf_config, "vision_config")
+        # Use mmproj presence to detect multimodal GGUF rather than config
+        # inspection: some configs (e.g. Qwen3_5MoeConfig) always create a
+        # vision_config even for text-only models.
+        hf_config = model_config.hf_config
+        vision_config = getattr(hf_config, "vision_config", None)
+        is_multimodal = vision_config is not None and hasattr(
+            vision_config, "num_hidden_layers"
+        )
+        mmproj_file = detect_gguf_multimodal(model_name_or_path)
         if is_multimodal:
-            mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
             )
+        if mmproj_file is not None:
             logger.info("Loading extra mm_proj weights from %s...", mmproj_file)
             mm_proj_weight_type_map = get_gguf_weight_type_map(
                 mmproj_file, gguf_to_hf_name_map
@@ -384,15 +455,21 @@ class GGUFModelLoader(BaseModelLoader):
         Yields:
             Tuples of (parameter_name, tensor) for all model weights
         """
+        # Use mmproj presence to detect multimodal GGUF rather than config
+        # inspection: some configs (e.g. Qwen3_5MoeConfig) always create a
+        # vision_config even for text-only models.
         hf_config = model_config.hf_config
-        is_multimodal = hasattr(hf_config, "vision_config")
-
+        vision_config = getattr(hf_config, "vision_config", None)
+        is_multimodal = vision_config is not None and hasattr(
+            vision_config, "num_hidden_layers"
+        )
+        mmproj_file = detect_gguf_multimodal(model_name_or_path)
         if is_multimodal:
-            # Load mm_proj (mm_encoder + projector) for multimodal weights
-            mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
             )
+        if mmproj_file is not None:
+            # Load mm_proj (mm_encoder + projector) for multimodal weights
             yield from gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
 
         gguf_files = self._get_all_gguf_files(model_name_or_path)

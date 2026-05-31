@@ -533,6 +533,16 @@ class GGUFLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Visual-encoder params of text-only GGUF models (e.g. Qwen3.5-MoE
+        # GGUF without mmproj) are never loaded and stay as
+        # GGUFUninitializedParameter. Return zero output so warmup passes.
+        if isinstance(layer.qweight, GGUFUninitializedParameter):
+            out_size = layer.qweight.tensor_shape[0]
+            out = torch.zeros((*x.shape[:-1], out_size), dtype=x.dtype, device=x.device)
+            if bias is not None:
+                out.add_(bias)
+            return out
+
         shard_id = layer.qweight.shard_id
 
         if shard_id:

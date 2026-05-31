@@ -3,8 +3,23 @@
 !!! warning
     Please note that GGUF support in vLLM is highly experimental and under-optimized at the moment, it might be incompatible with other features. Currently, you can use GGUF as a way to reduce memory footprint. If you encounter any issues, please report them to the vLLM team.
 
-!!! warning
-    Currently, vllm only supports loading single-file GGUF models. If you have a multi-files GGUF model, you can use [gguf-split](https://github.com/ggerganov/llama.cpp/pull/6135) tool to merge them to a single-file model.
+!!! note "Multi-file GGUF"
+    vLLM supports multi-shard GGUF files when shards follow the standard
+    `-00001-of-00005.gguf` naming convention. If your shards use a different naming
+    scheme, merge them first with the
+    [gguf-split](https://github.com/ggerganov/llama.cpp/pull/6135) tool.
+
+## Supported architectures
+
+vLLM supports GGUF loading for the following model families:
+
+| Type | Examples |
+|------|---------|
+| Dense | LLaMA, Qwen2/3, Phi-3, GPT-2, Mistral, Gemma, StableLM |
+| MoE | DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Qwen3.5-MoE, MiniMax-M2 |
+| Multimodal | Gemma3 (requires a companion `mmproj-*.gguf` file in the same directory) |
+
+Tensor-parallel (`--tensor-parallel-size N`) is supported for all of the above.
 
 To run a GGUF model with vLLM, you can use the `repo_id:quant_type` format to load directly from HuggingFace. For example, to load a Q4_K_M quantized model from [unsloth/Qwen3-0.6B-GGUF](https://huggingface.co/unsloth/Qwen3-0.6B-GGUF):
 

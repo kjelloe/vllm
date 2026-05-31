@@ -220,10 +220,13 @@ class Qwen3_5Model(Qwen3NextModel):
         self.config = config
 
         self.vocab_size = config.vocab_size
+        quant_config = vllm_config.quant_config
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):
@@ -421,6 +424,13 @@ class Qwen3_5Model(Qwen3NextModel):
                             f"Parameter {name} not found in params_dict, skip loading"
                         )
                         continue
+                    # GGUF stores shared_expert_gate as a 1D vector;
+                    # the vLLM param is [1, hidden_size].
+                    if (
+                        "mlp.shared_expert_gate" in name
+                        and len(loaded_weight.shape) == 1
+                    ):
+                        loaded_weight = loaded_weight[None, :]
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

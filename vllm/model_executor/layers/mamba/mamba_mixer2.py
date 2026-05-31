@@ -180,6 +180,11 @@ def mamba_v2_sharded_weight_loader(
     """
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        # GGUF stores conv1d weights as 2D [conv_dim, kernel_size]; the vLLM
+        # param is 3D after unsqueeze(1). Add the missing groups dimension.
+        if param.dim() == 3 and loaded_weight.dim() == 2 and param.size(1) == 1:
+            loaded_weight = loaded_weight.unsqueeze(1)
+
         # - track boundary of (sharded) param, and loaded_weight, respectively
         boundary, loaded_boundary = 0, 0
 

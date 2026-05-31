@@ -183,12 +183,26 @@ class HFConfigParser(ConfigParserBase):
         kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
         trust_remote_code |= kwargs.get("trust_remote_code", False)
         kwargs = without_trust_remote_code(kwargs)
-        config_dict, _ = PretrainedConfig.get_config_dict(
-            model,
-            revision=revision,
-            code_revision=code_revision,
-            **kwargs,
-        )
+        try:
+            config_dict, _ = PretrainedConfig.get_config_dict(
+                model,
+                revision=revision,
+                code_revision=code_revision,
+                **kwargs,
+            )
+        except ValueError as e:
+            if "gguf_file" in kwargs:
+                # transformers' load_gguf_checkpoint raised ValueError for a
+                # GGUF architecture it doesn't recognise yet.  Re-raise with
+                # a helpful hint so users know how to unblock themselves.
+                raise ValueError(
+                    f"{e}\n\nThe GGUF file's architecture is not yet "
+                    "supported by the transformers config loader.  "
+                    "Provide the HuggingFace config explicitly with "
+                    "--hf-config-path <original_hf_repo>, e.g.:\n"
+                    "  --hf-config-path Qwen/Qwen3.5-35B-A3B"
+                ) from e
+            raise
         # Use custom model class if it's in our registry
         model_type = config_dict.get("model_type")
         if model_type is None:
@@ -622,12 +636,18 @@ def maybe_override_with_speculators(
     else:
         gguf_model_repo = None
     kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
-    config_dict, _ = PretrainedConfig.get_config_dict(
-        model if gguf_model_repo is None else gguf_model_repo,
-        revision=revision,
-        token=hf_token,
-        **without_trust_remote_code(kwargs),
-    )
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model if gguf_model_repo is None else gguf_model_repo,
+            revision=revision,
+            token=hf_token,
+            **without_trust_remote_code(kwargs),
+        )
+    except ValueError:
+        # transformers' load_gguf_checkpoint raises ValueError for GGUF
+        # architectures it doesn't yet recognise (e.g. qwen35moe).
+        # No speculators config can be extracted; return original values.
+        return model, tokenizer, vllm_speculative_config
     speculators_config = config_dict.get("speculators_config")
 
     if speculators_config is None:

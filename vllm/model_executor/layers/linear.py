@@ -700,9 +700,29 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         if isinstance(loaded_shard_id, tuple) and (
             is_gguf_weight or is_gguf_weight_type
         ):
-            raise NotImplementedError(
-                "Shard id with multiple indices is not supported for GGUF."
-            )
+            if is_gguf_weight_type:
+                # All shards in the tuple share the same quantization type.
+                for sid in loaded_shard_id:
+                    param.data[sid].copy_(loaded_weight)
+                    param.shard_weight_type[sid] = loaded_weight.item()
+                return
+            # Pre-fused tensor covers consecutive shards (e.g. GGUF attn_qkv
+            # for Qwen3.5 SSM layers covering q+k+v). GGUF stores quantized
+            # weights as 2D [rows, cols_packed] where each row is an
+            # independent quantization unit, so we can narrow along output_dim
+            # (dim 0) to split into per-shard entries in data_container.
+            output_dim = getattr(param, "output_dim", None)
+            output_sizes = self.output_sizes[
+                loaded_shard_id[0] : loaded_shard_id[-1] + 1
+            ]
+            shard_offset = 0
+            for sid, shard_size in zip(loaded_shard_id, output_sizes):
+                shard_tensor = loaded_weight.narrow(
+                    output_dim, shard_offset, shard_size
+                )
+                self.weight_loader(param, shard_tensor, sid)
+                shard_offset += shard_size
+            return
         if is_gguf_weight_type:
             if loaded_shard_id is not None:
                 param.data[loaded_shard_id].copy_(loaded_weight)
