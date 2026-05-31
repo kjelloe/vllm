@@ -1,0 +1,11 @@
+1. Verify both GPUs are visible:
+  nvidia-smi --list-gpus
+  2. Run the test:
+  export PATH="/mnt/c/GIT/vllm/.venv/bin:$PATH"
+  python3 ./test_qwen35moe_tp2.py
+  3. What to look for in the output:
+    - No weight skipped warnings during loading — means all expert weights were found
+    - No NaN/inf warnings — means TP sharding didn't corrupt weights
+    - Three PASS lines at the bottom — basic coherence confirms the model is functional across both GPUs                                                                    4. If it passes, update pr.md (uncheck the last checklist item) and open the upstream PR using that content.                                                               
+
+
