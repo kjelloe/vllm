@@ -314,7 +314,7 @@ def _fused_moe_gguf(
             topk_weights.view(num_tokens, top_k, 1)
         )
         ops.moe_sum(out, out_hidden_states)
-    elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
+    elif qweight_type2 in MMQ_QUANT_TYPES and qweight_type in MMQ_QUANT_TYPES:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
