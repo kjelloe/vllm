@@ -509,7 +509,18 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = self._get_gguf_weight_type(
             model_config, local_model_path, gguf_weights_map
         )
-        # filter out unquantized modules to skip
+        # Filter out unquantized modules to skip.
+        # NOTE: weight_type_map keys use HF-namespace names (e.g.
+        # "model.layers.0.mlp.gate_proj" for most models; for multimodal
+        # wrappers like qwen35moe that add a "model.language_model." prefix
+        # via Bug-F, the key is "model.language_model.layers.0.mlp.gate_proj").
+        # is_layer_skipped_gguf checks these names against vLLM module prefixes
+        # via substring matching. In practice this is only an issue for F32/F16
+        # linear layers, which do not exist in any current K-quant or imatrix
+        # GGUF — all linear layers are quantized. If a mixed-precision GGUF is
+        # encountered this may silently fail to skip an unquantized linear layer;
+        # the GGUF path handles F32 correctly anyway via the UNQUANTIZED_TYPES
+        # fallback in _fused_mul_mat_gguf, so correctness is preserved.
         unquant_names = [
             name.removesuffix(".weight")
             for name, weight_type in weight_type_map.items()

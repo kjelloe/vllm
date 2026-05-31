@@ -55,6 +55,14 @@ vllm serve unsloth/Qwen3-0.6B-GGUF:Q4_K_M \
    --hf-config-path Qwen/Qwen3-0.6B
 ```
 
+!!! note "I-Matrix quantization and MoE models"
+    GGUF files that use I-Matrix quantization types (IQ1_M, IQ2_M, IQ3_S, IQ4_XS, etc.)
+    for their expert layers do **not** have a fast fused MoE kernel. vLLM will fall back
+    to a per-token loop, which is correct but significantly slower than the batched kernel
+    used for K-quants (Q4_K_M, Q6_K, etc.).
+
+    For best MoE inference performance, prefer K-quant GGUF files (Q4_K_M or higher).
+
 !!! note "Qwen3.5-MoE always requires --hf-config-path"
     The `qwen35moe` architecture identifier used in GGUF files is not recognized by
     HuggingFace's config parser. You must pass `--hf-config-path` pointing to the
