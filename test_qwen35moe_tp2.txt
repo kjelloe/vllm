@@ -1,9 +1,61 @@
+# Setup new PC:
+---
+  What the new machine needs (not in git)
+                                                                                                                                                                            1. Model file — must be copied manually
+
+  Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf   (~20 GB)
+  Currently at: $LLAMA_MODELS_DIR/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf
+  Copy it to the same path on the new machine, or any path — just update $LLAMA_MODELS_DIR.                                                                               
+  2. Environment variable
+
+  export LLAMA_MODELS_DIR="/path/to/your/models"
+  Add to ~/.bashrc (or ~/.zshrc) on the new machine. The test script uses it to find the GGUF file.
+                                                                                                                                                                            3. HF tokenizer/config — will auto-download on first run
+
+  --tokenizer Qwen/Qwen3.5-35B-A3B and --hf-config-path Qwen/Qwen3.5-35B-A3B both pull from HuggingFace Hub. The new machine needs internet access on first run (or copy    ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/ from this machine). No auth token needed — this model is ungated.
+
+  4. Python environment — rebuild from scratch
+
+  cd /path/to/vllm-clone
+  curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv not installed
+  uv venv --python 3.12                                                                                                                                                     VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+
+  5. Test script — copy or re-create
+
+  cp /tmp/test_qwen35moe_tp2.py ~/test_qwen35moe_tp2.py   # save from /tmp now
+  (Or just re-run the Claude Code session to recreate it — it's short.)
+                                                                                                                                                                            6. NVIDIA WSL2 driver
+
+  The new Windows install needs the NVIDIA CUDA on WSL driver (https://developer.nvidia.com/cuda/wsl). Confirm both GPUs appear with:                                       nvidia-smi --list-gpus
+  # should show:   GPU 0: NVIDIA GeForce RTX 3090
+  #                GPU 1: NVIDIA GeForce RTX 3090
+
+  ---                                                                                                                                                                       Quick-start on the new machine
+
+  # 1. Clone this branch
+  git clone -b <your-branch> https://github.com/<you>/vllm.git
+  cd vllm
+
+  # 2. Build env
+  uv venv --python 3.12
+  VLLM_USE_PRECOMPILED=1 .venv/bin/pip install -e . --torch-backend=auto   # or via uv
+
+  # 3. Run the test
+  export LLAMA_MODELS_DIR="/path/to/models"
+  export PATH="$PWD/.venv/bin:$PATH"
+  python3 ~/test_qwen35moe_tp2.py
+
+  The only hard dependency that can't be automated is the GGUF file itself — everything else either comes from git, rebuilds from pyproject.toml, or downloads from
+  HuggingFace.
+
+# Run POC script
+
 1. Verify both GPUs are visible:
   nvidia-smi --list-gpus
-  2. Run the test:
+2. Run the test:
   export PATH="/mnt/c/GIT/vllm/.venv/bin:$PATH"
   python3 ./test_qwen35moe_tp2.py
-  3. What to look for in the output:
+3. What to look for in the output:
     - No weight skipped warnings during loading — means all expert weights were found
     - No NaN/inf warnings — means TP sharding didn't corrupt weights
     - Three PASS lines at the bottom — basic coherence confirms the model is functional across both GPUs                                                                    4. If it passes, update pr.md (uncheck the last checklist item) and open the upstream PR using that content.                                                               
