@@ -14,6 +14,12 @@ TARGET_PATH="${VLLM_RS_TARGET_PATH:-$REPO_ROOT/vllm/vllm-rs}"
 # Read the required toolchain from rust-toolchain.toml.
 TOOLCHAIN=$(grep '^channel' "$REPO_ROOT/rust-toolchain.toml" | sed 's/.*= *"\(.*\)"/\1/')
 
+# Ensure protoc is available (required by prost-build).
+if ! command -v protoc &>/dev/null; then
+    echo "Error: protoc not found. Install it with: apt-get install protobuf-compiler" >&2
+    exit 1
+fi
+
 # Ensure rustup and the required toolchain are available.
 if ! command -v rustup &>/dev/null; then
     echo "rustup not found, installing..."
