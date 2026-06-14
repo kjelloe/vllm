@@ -154,7 +154,21 @@ class TopKTopPSampler(nn.Module):
         # flashinfer sampling functions expect contiguous logits.
         # In flex_attn/triton_attn fp32 inference, logits can be non-contiguous
         # because of slicing operation in logits_processor.
-        return flashinfer_sample(logits.contiguous(), k, p, generators), None
+        try:
+            return flashinfer_sample(logits.contiguous(), k, p, generators), None
+        except RuntimeError as e:
+            if "no kernel image is available" in str(e):
+                # The FlashInfer wheel was not compiled for this device's
+                # compute capability (e.g. Blackwell consumer GPUs). Fall back
+                # permanently to the PyTorch-native sampler for this worker.
+                logger.warning_once(
+                    "FlashInfer top-k/top-p kernel unavailable on this device "
+                    "(no kernel image); falling back to PyTorch-native sampler. "
+                    "Set VLLM_USE_FLASHINFER_SAMPLER=0 to silence this warning."
+                )
+                self.forward = self.forward_native
+                return self.forward_native(logits, generators, k, p)
+            raise
 
     def forward_cpu(
         self,
