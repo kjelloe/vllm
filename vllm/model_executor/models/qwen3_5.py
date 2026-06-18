@@ -307,6 +307,7 @@ class Qwen3_5Model(Qwen3NextModel):
         num_experts = (
             self.config.num_experts if hasattr(self.config, "num_experts") else 0
         )
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -338,7 +339,6 @@ class Qwen3_5Model(Qwen3NextModel):
                 # Skip layers on other devices.
                 if is_pp_missing_parameter(name, self):
                     continue
-                # name = apply_attn_prefix(name, params_dict)
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -395,6 +395,8 @@ class Qwen3_5Model(Qwen3NextModel):
                             or name_mapped.endswith("_bias")
                         ) and name_mapped not in params_dict:
                             continue
+                        if name_mapped not in params_dict:
+                            continue
                         param = params_dict[name_mapped]
                         weight_loader = param.weight_loader
                         success = weight_loader(
@@ -420,10 +422,17 @@ class Qwen3_5Model(Qwen3NextModel):
                     if is_pp_missing_parameter(name, self):
                         continue
                     if name not in params_dict:
-                        logger.warning_once(
-                            f"Parameter {name} not found in params_dict, skip loading"
-                        )
-                        continue
+                        # GGUF F32 tensors keep .weight suffix; params are
+                        # stored as .qweight. Try the qweight variant.
+                        name_q = name.replace(".weight", ".qweight")
+                        if name_q in params_dict:
+                            name = name_q
+                        else:
+                            logger.warning_once(
+                                f"Parameter {name} not found in params_dict,"
+                                " skip loading"
+                            )
+                            continue
                     # GGUF stores shared_expert_gate as a 1D vector;
                     # the vLLM param is [1, hidden_size].
                     if (

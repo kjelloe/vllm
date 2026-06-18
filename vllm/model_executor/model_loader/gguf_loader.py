@@ -354,6 +354,20 @@ class GGUFModelLoader(BaseModelLoader):
             if gguf_name is None:
                 gguf_name = text_name_map.get_name(base_name)
 
+            # Priority 3: For multimodal architectures where the name-mapping
+            # dummy is a text-only model (e.g. qwen35moe), its state_dict uses
+            # plain 'model.layers.*' keys.  After Priority 1/2 strip the outer
+            # 'model.' the remainder ('layers.*') may not resolve in gguf-py,
+            # which expects the full 'model.layers.*' prefix for novel params
+            # (e.g. linear_attn.in_proj_qkv, linear_attn.A_log).  Retry once
+            # with the prefix restored.
+            if (
+                gguf_name is None
+                and is_multimodal
+                and not base_name.startswith("model.")
+            ):
+                gguf_name = text_name_map.get_name("model." + base_name)
+
             if gguf_name is None:
                 return None
 
