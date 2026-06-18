@@ -141,8 +141,14 @@ def is_layer_skipped_gguf(
 
         is_skipped = None
         for shard_prefix in shard_prefixes:
+            # Use the same direction as the non-fused check: test whether any
+            # unquantized module name is a substring of the shard prefix.
+            # The original `shard_prefix in module_name` direction fails for
+            # multimodal wrappers (e.g. qwen35moe) where the vLLM layer prefix
+            # has an extra leading "model." compared to the post-mapper
+            # unquantized module names.
             is_shard_skipped = any(
-                shard_prefix in module_name for module_name in unquantized_modules
+                module_name in shard_prefix for module_name in unquantized_modules
             )
 
             if is_skipped is None:
