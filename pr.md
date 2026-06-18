@@ -82,17 +82,22 @@ export PATH="/mnt/c/GIT/vllm/.venv/bin:$PATH"
 
 Result: model loads cleanly (no weight-skip warnings in loader), inference runs end-to-end without crashing. Output quality is limited by the aggressive IQ2_M/IQ3_S (~3-bit average) quantization on a hybrid SSM+MoE architecture — this is a quantization-quality floor, not a code bug.
 
-**Pending — Q4_K_M coherence validation** (hardware constraint: second GPU not yet configured in current WSL2 session):
+**Q4_K_M TP=2 coherence validation — IN PROGRESS** (2026-06-18):
 
 ```bash
-export PATH="/mnt/c/GIT/vllm/.venv/bin:$PATH"
-vllm serve "$LLAMA_MODELS_DIR/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf" \
-  --tokenizer Qwen/Qwen3.5-35B-A3B \
-  --hf-config-path Qwen/Qwen3.5-35B-A3B \
-  --tensor-parallel-size 2 --enforce-eager --max-model-len 8192
+# Coherence test: 3 prompts — "2+2", "capital of France", fibonacci
+.venv/bin/python /tmp/run.py /tmp/test_qwen35moe_tp2.py
 ```
 
-Will update this PR with results before requesting merge.
+Status: Model loads cleanly. Inference runs. Output is incoherent garbage on all 3 prompts. Root cause under active investigation — see `BUG_HYPOTHESIS.md` for ranked hypotheses.
+
+Next diagnostic step: TP=1 test to isolate whether bug is TP-specific or fundamental:
+
+```bash
+.venv/bin/python /tmp/run.py /tmp/test_tp1.py
+```
+
+Will update this PR with passing test results before requesting merge.
 
 ## AI assistance
 

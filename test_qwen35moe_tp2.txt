@@ -53,11 +53,36 @@
 1. Verify both GPUs are visible:
   nvidia-smi --list-gpus
 2. Run the test:
-  export PATH="/mnt/c/GIT/vllm/.venv/bin:$PATH"
-  python3 ./test_qwen35moe_tp2.py
+  export PATH="/home/kjelloe/GIT/vllm/.venv/bin:$PATH"
+  .venv/bin/python /tmp/run.py /tmp/test_qwen35moe_tp2.py
 3. What to look for in the output:
     - No weight skipped warnings during loading — means all expert weights were found
     - No NaN/inf warnings — means TP sharding didn't corrupt weights
-    - Three PASS lines at the bottom — basic coherence confirms the model is functional across both GPUs                                                                    4. If it passes, update pr.md (uncheck the last checklist item) and open the upstream PR using that content.                                                               
+    - Three PASS lines at the bottom — basic coherence confirms the model is functional across both GPUs
+4. If it passes, update pr.md (uncheck the last checklist item) and open the upstream PR using that content.
 
+# Current status (2026-06-18)
+
+Model loads without errors. Inference runs. Output is garbage on all 3 prompts.
+Root cause under active investigation. See BUG_HYPOTHESIS.md for ranked hypotheses.
+
+## Next diagnostic steps (in order)
+
+1. TP=1 isolation test:
+   .venv/bin/python /tmp/run.py /tmp/test_tp1.py
+   → If TP=1 passes: bug is TP-specific (GDN state split, TP communication)
+   → If TP=1 also fails: bug is in weight loading or model forward pass (H2/H3)
+
+2. Weight stats check:
+   .venv/bin/python /tmp/run.py /tmp/check_weight_stats.py -- --tp1
+   → Checks NaN/zero weight fractions and quant method types per layer
+
+3. embed_tokens quant method check:
+   In check_weight_stats.py, print type(m.embed_tokens.quant_method).__name__
+   → Should be GGUFEmbeddingMethod (Fix L); if UnquantizedEmbeddingMethod, H2 is the bug
+
+## Run wrapper
+
+/tmp/run.py handles PATH, LLAMA_MODELS_DIR, and output filtering. Usage:
+  .venv/bin/python /tmp/run.py <script.py> [head_N] [-- extra_args]
 
