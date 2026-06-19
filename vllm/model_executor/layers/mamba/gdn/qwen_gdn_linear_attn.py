@@ -1458,6 +1458,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 apply_l2norm=True,
                 output_g_exp=False,
             )
+            if self.layer_idx == 0:
+                import sys as _sys
+                print(f"[GDN L0 postconv] qn={query_non_spec.float().norm():.4f} "
+                      f"kn={key_non_spec.float().norm():.4f} vn={value_non_spec.float().norm():.4f} "
+                      f"g={g_non_spec.float().mean():.4f} beta={beta_non_spec.float().mean():.4f}",
+                      file=_sys.stderr, flush=True)
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
             value_non_spec = value_non_spec.unsqueeze(0)
@@ -1519,6 +1525,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
             )
+            if self.layer_idx == 0:
+                import sys as _sys
+                print(f"[GDN L0 chunkdelta] out={core_attn_out_non_spec.float().norm():.6f} "
+                      f"shape={core_attn_out_non_spec.shape}",
+                      file=_sys.stderr, flush=True)
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
