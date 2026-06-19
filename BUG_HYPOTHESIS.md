@@ -205,16 +205,16 @@ is_layer_skipped_gguf("language_model.model.layers.0.linear_attn.in_proj_ba",
 
 ```bash
 # TP=1 coherence test
-.venv/bin/python /tmp/run.py /tmp/test_tp1.py
+.venv/bin/python debugging/run.py debugging/test_tp1.py
 
 # Sensitivity analysis (same output for all inputs = context ignored)
-.venv/bin/python /tmp/run.py /tmp/test_sensitivity.py
+.venv/bin/python debugging/run.py debugging/test_sensitivity.py
 
 # Raw GGUF + dequantize check (no vLLM model)
-.venv/bin/python /tmp/check_embed_direct.py
+.venv/bin/python debugging/check_embed_direct.py
 
 # Conv1d weight shape check (raw GGUF)
-.venv/bin/python /tmp/check_conv1d.py
+.venv/bin/python debugging/check_conv1d.py
 ```
 
 ### H9 debug patch (temporary)
@@ -231,4 +231,4 @@ def _forward_core(self, attn_metadata_raw, ...):
     # ... rest of forward
 ```
 
-Then run `/tmp/test_tp1.py` and look for `[GDN]` lines. If `meta_is_none=True` during inference, H9 is confirmed.
+Then run `debugging/test_tp1.py` and look for `[GDN]` lines. If `meta_is_none=True` during inference, H9 is confirmed.
