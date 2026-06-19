@@ -82,20 +82,17 @@ export PATH="/mnt/c/GIT/vllm/.venv/bin:$PATH"
 
 Result: model loads cleanly (no weight-skip warnings in loader), inference runs end-to-end without crashing. Output quality is limited by the aggressive IQ2_M/IQ3_S (~3-bit average) quantization on a hybrid SSM+MoE architecture — this is a quantization-quality floor, not a code bug.
 
-**Q4_K_M TP=2 coherence validation — IN PROGRESS** (2026-06-18):
+**Q4_K_M coherence validation — IN PROGRESS** (2026-06-18):
 
 ```bash
-# Coherence test: 3 prompts — "2+2", "capital of France", fibonacci
+# TP=1 coherence test (FAILED — garbage output)
+.venv/bin/python /tmp/run.py /tmp/test_tp1.py
+
+# TP=2 coherence test (FAILED — garbage output)
 .venv/bin/python /tmp/run.py /tmp/test_qwen35moe_tp2.py
 ```
 
-Status: Model loads cleanly. Inference runs. Output is incoherent garbage on all 3 prompts. Root cause under active investigation — see `BUG_HYPOTHESIS.md` for ranked hypotheses.
-
-Next diagnostic step: TP=1 test to isolate whether bug is TP-specific or fundamental:
-
-```bash
-.venv/bin/python /tmp/run.py /tmp/test_tp1.py
-```
+Status: Model loads cleanly. Inference runs. Output is incoherent garbage on **both TP=1 and TP=2** — bug is not TP-specific. Extensive code trace (weight loading, name mapping, quant method assignment, GDN conv1d shape, F32 weight values, embed dequantize) found no incorrect paths. Root cause under active investigation — leading hypothesis is H9 (GDN `_forward_core` returns early because `attn_metadata_raw is None`). See `BUG_HYPOTHESIS.md`.
 
 Will update this PR with passing test results before requesting merge.
 
