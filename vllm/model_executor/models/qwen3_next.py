@@ -29,7 +29,7 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import (
-    GemmaRMSNorm as Qwen3NextRMSNorm,
+    RMSNorm as Qwen3NextRMSNorm,
 )
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,

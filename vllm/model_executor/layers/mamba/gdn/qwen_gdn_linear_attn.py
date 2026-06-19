@@ -863,10 +863,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
+        # DEBUG: check z and pre-norm norms (layer 0 only)
+        if self.layer_idx == 0:
+            import sys as _sys
+            print(f"[GDN L0 outproj] pre_norm={core_attn_out.float().norm().item():.4f} "
+                  f"z_norm={z.float().norm().item():.4f} ntok={num_tokens}",
+                  file=_sys.stderr, flush=True)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         output[:num_tokens], _ = self.out_proj(core_attn_out)
+        # DEBUG: check output projection result
+        if self.layer_idx == 0:
+            import sys as _sys
+            print(f"[GDN L0 outproj] post_proj={output[:num_tokens].float().norm().item():.4f}",
+                  file=_sys.stderr, flush=True)
 
     def forward_hip(
         self,
@@ -942,6 +953,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b = b.contiguous()
             a = a.contiguous()
 
+        if self.layer_idx == 0:
+            import sys as _sys
+            _q_size = self.key_dim // self.tp_size
+            _k_size = self.key_dim // self.tp_size
+            _v_size = self.value_dim // self.tp_size
+            _q, _k, _v_raw = mixed_qkv.split([_q_size, _k_size, _v_size], dim=-1)
+            print(f"[GDN L0 fwd] hs={hidden_states.float().norm():.4f} "
+                  f"mixed_qkvz={mixed_qkvz.float().norm():.4f} ba={ba.float().norm():.4f} "
+                  f"q={_q.float().norm():.4f} k={_k.float().norm():.4f} v={_v_raw.float().norm():.4f} "
+                  f"b={b.float().norm():.4f} a={a.float().norm():.4f} "
+                  f"b_mean={b.float().mean():.4f} a_mean={a.float().mean():.4f}",
+                  file=_sys.stderr, flush=True)
+
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
@@ -961,6 +985,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             fast_kernel=False,
             layer_name=_encode_layer_name(self.prefix),
         )
+
+        if self.layer_idx == 0:
+            import sys as _sys
+            print(f"[GDN L0 core] core_attn_out={core_attn_out.float().norm():.6f} "
+                  f"shape={core_attn_out.shape}",
+                  file=_sys.stderr, flush=True)
 
         # ============================================================
         # Part 3: Output Projection
@@ -1315,6 +1345,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             else self_kv_cache[0].transpose(-1, -2)
         )
         ssm_state = self_kv_cache[1]
+        # DEBUG kvcache+state: remove after root cause found
+        if self.layer_idx == 0:
+            import sys as _sys
+            _cs = self_kv_cache[0]
+            _ss = self_kv_cache[1]
+            print(f"[GDN L0] conv_state shape={_cs.shape} ssm_state shape={_ss.shape} "
+                  f"nprefill={attn_metadata.num_prefills} ndecode={attn_metadata.num_decodes}",
+                  file=_sys.stderr, flush=True)
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
@@ -1522,6 +1560,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+        # DEBUG output: remove after root cause found
+        if self.layer_idx == 0:
+            import sys as _sys
+            print(f"[GDN L0 out] core_attn_out norm={core_attn_out.float().norm().item():.4f} "
+                  f"nprefill={attn_metadata.num_prefills}", file=_sys.stderr, flush=True)
 
     def _forward_core_decode_fast(
         self,
@@ -1641,6 +1684,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
         )
+        # DEBUG output: remove after root cause found
+        if self.layer_idx == 0:
+            import sys as _sys
+            print(f"[GDN L0 decode] core_attn_out norm={core_attn_out.float().norm().item():.4f}",
+                  file=_sys.stderr, flush=True)
         return
 
 

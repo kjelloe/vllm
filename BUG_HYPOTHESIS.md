@@ -117,7 +117,7 @@ After Fix F, the HF-namespace name for lm_head in `gguf_to_hf_name_map` is `mode
 **This is architecturally critical:** garbage logits = garbage output regardless of how good the hidden states are.  
 **Diagnosis:**
 ```python
-m = llm.llm_engine.driver_worker.model_runner.model
+m = llm.llm_engine.model_executor.driver_worker.worker.model_runner.model
 lm = m.language_model
 print("lm_head same as embed:", lm.lm_head.weight.data_ptr() == lm.model.embed_tokens.weight.data_ptr())
 print("lm_head weight norm:", lm.lm_head.weight.float().norm().item())
@@ -164,7 +164,7 @@ print("a range:", a_part.min().item(), a_part.max().item())
 ```python
 from vllm import LLM
 llm = LLM(model=..., enforce_eager=True)
-m = llm.llm_engine.driver_worker.model_runner.model
+m = llm.llm_engine.model_executor.driver_worker.worker.model_runner.model
 print(type(m.language_model.model.embed_tokens.quant_method).__name__)
 ```
 
