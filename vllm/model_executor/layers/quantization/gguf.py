@@ -552,8 +552,16 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = layer.qweight.shard_id
 
         if shard_id:
-            # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            # dequantize shard weights respectively; sort integer shard IDs so
+            # the output is always in logical shard order (0, 1, 2, …) regardless
+            # of the order the shards were loaded from the GGUF file. For example,
+            # Qwen3.5 GDN in_proj_qkvz: the GGUF stores attn_gate (Z, shard 3)
+            # before attn_qkv (Q/K/V, shards 0-2), so without sorting the output
+            # would be [Z, Q, K, V] instead of the expected [Q, K, V, Z].
+            if "q" in shard_id:
+                shard_id = ["q", "k", "v"]
+            else:
+                shard_id = sorted(shard_id)
             qweight = layer.qweight
             result = []
             for idx in shard_id:
