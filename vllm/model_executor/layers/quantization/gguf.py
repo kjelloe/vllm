@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
@@ -93,6 +94,14 @@ class GGUFConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
         if isinstance(layer, LinearBase):
+            if is_layer_skipped_gguf(
+                prefix, self.unquantized_modules, self.packed_modules_mapping
+            ):
+                return UnquantizedLinearMethod()
+            return GGUFLinearMethod(self)
+        elif isinstance(layer, ParallelLMHead):
+            # ParallelLMHead is a VocabParallelEmbedding subclass but needs
+            # linear matmul for logit projection, not embedding lookup.
             if is_layer_skipped_gguf(
                 prefix, self.unquantized_modules, self.packed_modules_mapping
             ):
