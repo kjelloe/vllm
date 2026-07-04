@@ -57,14 +57,27 @@ see STRUCTURAL CHANGE section). Fix = a self-contained `Qwen3_5GGUFAdapter`.
      `quantization/params.py:_gguf_weight_type_loader_v2` to store the
      weight-type per shard for a tuple shard_id (real `.qweight` already loads
      fine — `GGUFWeightParameter` has `output_dim` and row-narrows cleanly).
-   - **RoutedExperts MoE (IN PROGRESS):** next error is
-     `IndexError: index 0 is out of bounds for dimension 0 with size 0` at
-     `fused_moe/routed_experts.py:692` (`param.data[expert_id]` on empty data).
-     GGUF expert tensors are 3D packed `(256 experts, 512, 1152)` so
-     `full_load` should be True, but the `RoutedExperts` param isn't
-     materialized. Looks like a gap between the plugin's GGUF MoE
-     materialization (`_materialize_gguf_moe_param`) and vLLM's newer
-     `RoutedExperts` abstraction that Qwen3.5 uses. Under investigation.
+   - **RoutedExperts MoE (DIAGNOSED, unfixed):** `IndexError: index 0 is out
+     of bounds for dimension 0 with size 0` at `fused_moe/routed_experts.py:692`
+     (`param.data[expert_id]` on empty data). Instrumentation of the plugin's
+     `_gguf_moe_weight_loader` / `_materialize_gguf_moe_param` shows:
+     ```
+     [moe-mat] param=GGUFUninitializedWeightParameter uninit=True lw=(2048,420) shard=w2
+     [moe-load] wn=...experts.w2_qweight shard=w2 eid=0 lw=(2048,420) pdata=(0,)
+     ```
+     Root cause: the model (`QwenNextMixtureOfExperts` → `RoutedExperts`) loads
+     experts **per-expert** — each call gets a 2D packed slice `(2048, 420)`
+     (one expert of the GGUF `(256, 2048, 420)` tensor) plus an `expert_id`.
+     But the plugin's `_materialize_gguf_moe_param` only materializes the fused
+     param when it sees a **3D** tensor (`len(shape)==3`); it skips every 2D
+     per-expert slice, so `w2`/`w13` stay `UninitializedParameter` with empty
+     `.data`, and `param.data[expert_id]` throws.
+     **Fix direction:** materialize the RoutedExperts GGUF param to
+     `(num_local_experts, *per_expert_packed_shape)` (with the w1/w3 doubling
+     for `w13`) on the first per-expert slice — i.e. handle the 2D-slice path,
+     not just the 3D-full path. This is a general plugin gap (GGUF MoE +
+     vLLM's `RoutedExperts`), not strictly Qwen3.5-specific — good candidate to
+     raise with the plugin maintainer (Isotr0py).
 
    **Scope note:** supporting this model in the plugin has required 3+
    plugin-core fixes (adapter + params.py tuple-shard + MoE), not just the
