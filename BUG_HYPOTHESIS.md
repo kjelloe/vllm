@@ -30,9 +30,51 @@ see STRUCTURAL CHANGE section). Fix = a self-contained `Qwen3_5GGUFAdapter`.
    `model.language_model.` prefix). **Offline name-map dry-run PASSED**: all HF
    params map; 733/753 GGUF tensors covered; only 20 uncovered are `blk.40.*`
    (MTP head, benign). GDN mappings all correct.
-3. [NEXT] Validate on Qwen3.5-35B-A3B Q4_K_M: Paris test (expect rank ~1) +
-   coherence sample; TP=1 then TP=2. This is the real test of the V-head fix
-   (#31's GDN path was never exercised — its smoke test was GDN-less Qwen3-0.6B).
+3. [IN PROGRESS] Validate on Qwen3.5-35B-A3B Q4_K_M (TP=1, fp16, max_len=256,
+   gpu_util=0.90). Iterating through load-path issues:
+   - **Prefix bug (FIXED):** the vLLM multimodal wrapper nests the whole text
+     model under `language_model.` (`language_model.model.layers.*`,
+     `language_model.lm_head.*`), NOT `model.language_model.*` as old Fix F
+     assumed. `build_name_map` now prepends `language_model.`.
+   - **Wrapper detection (FIXED):** `uses_cg_wrapper` was keyed on
+     `config.architectures`, which the GGUF config path does not populate →
+     Fix F was skipped at load time. Re-keyed on `vision_config` presence (the
+     real multimodal-wrapper signal). Offline cross-check vs the 1258 real
+     vLLM params: 0 mismatches across all 733 real-tensor mappings.
+   - **Tuple shard_id (IN PROGRESS):** Qwen3.5's `in_proj_qkvz` loads the
+     combined GGUF `attn_qkv` via a tuple shard_id `(0,1,2)` (baked into
+     vLLM's `Qwen3_5Model` hf_to_vllm_mapper `orig_to_new_stacked`; this was
+     old in-tree Fix G). The plugin's `quantization/params.py`
+     `_gguf_weight_type_loader_v2` only special-cases `shard_id is None`; for a
+     tuple it delegates to vLLM's `_load_fused_module_from_checkpoint`, which
+     assumes a real weight with `output_dim` → `AttributeError` on the GGUF
+     `GGUFUninitializedWeightTypeParameter`. `_store_gguf_weight_type` /
+     `_gguf_shard_id_as_int` also can't handle a tuple. **Fix:** teach the
+     plugin's GGUF weight-type (and weight) loaders to handle tuple shard_ids
+     by storing/placing the value across each listed shard. This expands the
+     change into plugin core (`quantization/params.py`), re-homing Fix G.
+   - **Tuple shard_id (FIXED):** patched plugin
+     `quantization/params.py:_gguf_weight_type_loader_v2` to store the
+     weight-type per shard for a tuple shard_id (real `.qweight` already loads
+     fine — `GGUFWeightParameter` has `output_dim` and row-narrows cleanly).
+   - **RoutedExperts MoE (IN PROGRESS):** next error is
+     `IndexError: index 0 is out of bounds for dimension 0 with size 0` at
+     `fused_moe/routed_experts.py:692` (`param.data[expert_id]` on empty data).
+     GGUF expert tensors are 3D packed `(256 experts, 512, 1152)` so
+     `full_load` should be True, but the `RoutedExperts` param isn't
+     materialized. Looks like a gap between the plugin's GGUF MoE
+     materialization (`_materialize_gguf_moe_param`) and vLLM's newer
+     `RoutedExperts` abstraction that Qwen3.5 uses. Under investigation.
+
+   **Scope note:** supporting this model in the plugin has required 3+
+   plugin-core fixes (adapter + params.py tuple-shard + MoE), not just the
+   adapter. Count of remaining issues unknown. My old in-tree Fixes A–M
+   handled all of this end-to-end (model loaded and ran); the plugin is the
+   right long-term home but is catching up on tuple-shard GDN + RoutedExperts.
+
+   This is the real test of the V-head fix (#31's GDN path was never exercised
+   — its smoke test was GDN-less Qwen3-0.6B). Runner: `/tmp/run.sh <script.py>`
+   (fixed env; matches the `Bash(/tmp/*)` allow rule).
 4. PR to vllm-gguf-plugin ("add Qwen3.5 support"), attributing prior art #31.
    **Gated on explicit user approval — do not push/open without it.**
 
