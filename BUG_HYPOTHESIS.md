@@ -1,11 +1,43 @@
 # Bug Hypothesis: Garbage output from Qwen3.5-35B-A3B Q4_K_M GGUF
 
-**Date:** 2026-07-03 (updated)  
-**Status:** Under investigation — root cause not yet found  
+**Date:** 2026-07-04 (updated)  
+**Status:** ROOT CAUSE FOUND (2026-07-04) — GGUF stores GDN V-heads in ggml *tiled* order; vLLM expects HF *grouped* order and never converts. See "ROOT CAUSE" section below.  
 **NOTE (2026-07-03):** Branch merged with upstream/main. `Qwen3_5Model.load_weights` no longer uses a manual `stacked_params_mapping` loop; it now goes through `AutoWeightsLoader` with `hf_to_vllm_mapper` (`orig_to_new_stacked` at `vllm/model_executor/models/qwen3_5.py:203-210`). Same shard ids as before (`in_proj_qkv`→`(0,1,2)`, `in_proj_z`→`3`, `in_proj_b`→`0`, `in_proj_a`→`1`), but the code path is different — see Plan 0.  
 **Symptoms:** Model loads cleanly, inference runs, all outputs are incoherent garbage on both TP=1 and TP=2.  
 Examples: `"The capital of France is"` → `" is"` (top token), `" capital"` (rank 2), `" Cap"` (rank 3) — context-word copying pattern.  
 Paris rank ~1303 vs expected rank ~1.
+
+---
+
+## SESSION STATUS & NEXT ACTIONS (2026-07-04)
+
+**Root cause: FOUND and triple-confirmed.** GDN V-head tiling mismatch (see ROOT
+CAUSE section). Confirmed by (1) independent source analysis, (2) closed plugin
+PR #31's identical implementation, (3) empirical packed-layout check.
+
+**Fix home:** the out-of-tree `vllm-gguf-plugin` (GGUF is no longer in vLLM core —
+see STRUCTURAL CHANGE section). Fix = a self-contained `Qwen3_5GGUFAdapter`.
+
+**Next actions, in order:**
+1. [DONE 2026-07-04] Removed orphaned in-tree GGUF dead files
+   (`gguf_loader.py`, `quantization/gguf.py`) — staged, not committed. vLLM
+   still imports cleanly.
+2. [DONE 2026-07-04] Wrote `Qwen3_5GGUFAdapter` in
+   `vllm_gguf_plugin/weights_adapter/qwen3_5.py` (clone + site-packages 0.0.2),
+   registered in `_ADAPTER_REGISTRY`. Combines #31's verified `transform_weight`
+   (V-head reorder) with my proven `build_name_map` (arch remap
+   `qwen3_5_moe`→`qwen35moe`, text-only forcing, MoE + ssm_dt sideload,
+   `model.language_model.` prefix). **Offline name-map dry-run PASSED**: all HF
+   params map; 733/753 GGUF tensors covered; only 20 uncovered are `blk.40.*`
+   (MTP head, benign). GDN mappings all correct.
+3. [NEXT] Validate on Qwen3.5-35B-A3B Q4_K_M: Paris test (expect rank ~1) +
+   coherence sample; TP=1 then TP=2. This is the real test of the V-head fix
+   (#31's GDN path was never exercised — its smoke test was GDN-less Qwen3-0.6B).
+4. PR to vllm-gguf-plugin ("add Qwen3.5 support"), attributing prior art #31.
+   **Gated on explicit user approval — do not push/open without it.**
+
+**Env note:** plugin editable install fails (compiled `_C_gguf`); edit the
+pure-Python adapter in `.venv/.../vllm_gguf_plugin/` for testing.
 
 ---
 
@@ -73,6 +105,130 @@ Paris rank ~1303 vs expected rank ~1.
 | M | `vllm/model_executor/layers/quantization/gguf.py` | Fix imatrix MoE kernel dispatch (MMVQ→MMQ in `_fused_moe_gguf` elif) |
 | Fix2 | `vllm/model_executor/layers/quantization/gguf.py` | `is_layer_skipped_gguf` wrong direction: `module_name in shard_prefix` |
 | uint64 | `vllm/v1/worker/mamba_utils.py:242-243` | Cherry-pick `b5495cc5f`: MambaCopyBuffers src/dst ptrs `int64` → `uint64` |
+
+---
+
+## STRUCTURAL CHANGE (2026-07-04) — GGUF support migrated to an out-of-tree plugin
+
+The upstream merge (`3e879ebc2`) pulled in PR #39612
+"[Migration] Migrate GGUF quantization support to plugin", which **deleted the
+entire in-tree GGUF subsystem** (`gguf_loader.py`, `quantization/gguf.py`,
+`gguf_utils.py`, the `weight_utils` GGUF helpers, and the CUDA kernels) and moved
+it to [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)
+(`uv pip install vllm-gguf-plugin`; installed `0.0.2`).
+
+Consequence: **all Fixes A–M below live in files upstream no longer uses.** The
+merge kept our modified `gguf_loader.py`/`gguf.py` as orphaned dead code (nothing
+imports them; harmless, pending cleanup). GGUF is now provided solely by the
+plugin's `OOTGGUFModelLoader` + a `weights_adapter` registry.
+
+**The plugin does NOT support Qwen3.5(-MoE) yet.** Verified from its source
+(`.venv/.../vllm_gguf_plugin/weights_adapter/default.py`):
+- `build_name_map` looks up the gguf arch by matching HF `model_type` against
+  `gguf.MODEL_ARCH_NAMES` values. Our config reports `model_type="qwen3_5_moe"`
+  (text: `qwen3_5_moe_text`) but gguf-py's arch value is `"qwen35moe"` — no
+  remap exists (it special-cases cohere/gemma3/qwen2_moe/qwen3_moe/olmoe/
+  minimax_m2 only) → would raise `RuntimeError: Unknown gguf model_type`.
+- `is_multimodal` is set from `config.vision_config is not None`; Qwen3.5's
+  config carries a vision_config even for the text-only GGUF → false positive
+  (same issue as old Fix B/C).
+- No MoE expert sideload mapping for qwen3_5_moe (needs the `ffn_*_exps` block
+  like qwen3_moe).
+- No GDN V-head reorder (the root cause below is unfixed there too).
+
+**Fix path (chosen: adopt plugin).** Add a `Qwen35GGUFAdapter(GGUFWeightsAdapter)`
+to the plugin, registered in `weights_adapter/_ADAPTER_REGISTRY`, that:
+1. remaps `qwen3_5_moe`/`qwen3_5_moe_text` → gguf `QWEN35MOE` (and dense →
+   `QWEN35`);
+2. forces text-only name mapping despite `vision_config`;
+3. adds the MoE expert + shared-expert sideload entries;
+4. overrides `transform_weight` to apply the GDN V-head tiling→grouped reorder
+   (the root-cause fix — see below).
+The plugin's `transform_weight(hf_name, weight)` hook receives the raw packed
+GGUF tensor per weight (see `default.py:map_weights`), which is exactly the
+weight-space site chosen for the reorder. This re-homes Fixes A–F into the
+plugin's clean adapter API and adds the root-cause fix. Should be upstreamed as
+"add Qwen3.5 support" to vllm-gguf-plugin.
+
+**Duplicate-work check done (2026-07-04).** Plugin `main` has no qwen3_5 adapter
+(only base/default/gemma3/diffusion). No *open* PR covers it. Closed PR **#31**
+"Add Qwen3.5 and Gemma4 GGUF adapters" (AlexCheema `codex/qwen35-gemma4-adapters`)
+DID implement it but was **bulk-closed by the maintainer (Isotr0py) today with no
+comment** — part of a closed stack of bot-generated `codex/*` PRs, not a technical
+rejection. Its `weights_adapter/qwen3_5.py` implements the **exact**
+`_tiled_to_grouped_v_heads` inverse permutation independently derived above, on the
+same tensor set — a second confirmation of the root cause.
+
+**#31's quant strategy verified correct (empirically):** GGUF packed data for
+`attn_qkv` is `(8192, 1680)` = `[out_features, packed_input_bytes]`, so permuting
+rows along dim 0 moves whole independently-quantized output features — safe for the
+row-reordered tensors (in_proj_qkv V-rows, in_proj_z, in_proj_a/b, conv1d V-part,
+A_log, dt_bias). `out_proj` is `(2048, 4352)` with the reorder axis (input dim)
+packed inside the bytes → #31 force-dequantizes only `out_proj`, which is correct.
+Caveat: #31's only smoke test was Qwen3-0.6B (no GDN layers), so its GDN path was
+never actually exercised — our 35B-A3B run is the real validation.
+
+**Refined plan:** rather than transplant #31's 409-line `default.py` delta (bloated
+with Gemma4 + vision-tower + MTP mappings), write a **self-contained**
+`Qwen3_5GGUFAdapter` carrying its own text-only name-map (arch remap
+`qwen3_5_moe`→`QWEN35MOE`, MoE + shared-expert sideload) plus the verified
+`transform_weight`. Dev against the installed wheel `0.0.2` (editable install of the
+clone fails — compiled `_C_gguf` extension), mirror the adapter to the local clone
+`/home/kjelloe/GIT/vllm-gguf-plugin` for the PR. PR submission gated on user approval.
+
+---
+
+## ROOT CAUSE (confirmed 2026-07-04) — GDN V-head tiling mismatch
+
+**Mechanism.** llama.cpp's converter reorders the GDN value heads from HF's
+*grouped* layout to ggml's *tiled* layout for every arch where
+`num_key_heads != num_value_heads`. Qwen3.5 qualifies (16 K-heads vs 32
+V-heads, `num_v_per_k = 2`). vLLM's GDN implementation was written for HF
+safetensors (grouped) and never undoes the tiling, so all 30 GDN layers read
+V / Z-gate / beta / alpha / A_log / dt_bias / conv1d-V / out_proj heads in the
+wrong order. Result: attention mixes the wrong value heads → context-word
+copying, garbage output.
+
+**Layouts** (`num_v_per_k = num_value_heads // num_key_heads = 2`):
+- HF grouped (what vLLM expects): `[G0_v0, G0_v1, G1_v0, G1_v1, ...]`
+  — V head `j` pairs with K head `j // 2`.
+- ggml tiled (what the GGUF stores): `[G0_v0, G1_v0, ..., G0_v1, G1_v1, ...]`
+  — V head `j` pairs with K head `j % 16`.
+
+**Evidence:**
+1. Converter: `_LinearAttentionVReorderBase._reorder_v_heads` +
+   `modify_tensors`, `llama.cpp/conversion/qwen.py:353-518`. `Qwen3_5MoeTextModel`
+   (registered for `Qwen3_5MoeForCausalLM`) inherits it (`qwen.py:626`). Docstring:
+   "reorders V heads from grouped to tiled order for ggml broadcast" (PR #19468).
+   Reorders: V rows of `in_proj_qkv`; all of `in_proj_z`; `in_proj_a`/`in_proj_b`;
+   `A_log`/`dt_bias`/`dt_proj`; V-channels of `conv1d`; columns of `out_proj`.
+2. vLLM expects grouped: `fix_query_key_value_ordering`
+   (`qwen_gdn_linear_attn.py:644-695`) reshapes the interleaved (Qwen3-Next) case
+   as `(num_k_heads, [hk, hk, np/ng*hv, np/ng*hv])` → V heads emerge grouped by
+   K-head. The Qwen3.5 path (`:946-952`) does a plain split and feeds V straight
+   through in on-disk order. Grep confirms **no reorder/tiled/repeat_interleave**
+   anywhere in `vllm/model_executor/layers/mamba/gdn/` nor in `gguf_loader.py`.
+3. GGUF metadata: `head_count=16`, `ssm.inner_size=4096` (=32×128),
+   `ssm.group_count=16` → num_v_per_k=2, tiling is a non-trivial permutation.
+4. Symptom (context copying) is exactly what scrambled V/gate heads produce.
+
+**This subsumes prior hypotheses:** H_gdn_qkv_order (the Q/K/V *blocks* are in
+the right order — my earlier [K,Q,V] guess was wrong — but the V *heads within*
+the block are permuted) and H14 (beta/alpha aren't swapped, their rows are
+tiled-reordered — same mechanism).
+
+**FIX — convert tiled → grouped (inverse of `_reorder_v_heads`).** For a tensor
+with the V-head axis of length `num_v_heads*head_dim`, reshape that axis to
+`(num_v_per_k, num_k_heads, head_dim)`, swap the first two → `(num_k_heads,
+num_v_per_k, head_dim)`, flatten. Apply to the GGUF tensors listed above.
+Permutation granularity is `head_v_dim=128`, a multiple of every quant block
+size here (Q6_K/Q4_K super-block 256 along columns → rows independent; Q8_0
+blocks of 32 → 128 = 4 blocks), so a **weight-space** permute at load is
+quantization-safe. Two candidate fix sites (decision pending): (1) weight-space
+at GGUF load — model becomes bit-identical to safetensors, forward untouched;
+(2) activation-space in the GDN forward — no quant concerns, adds hot-path
+index_selects. Both must be gated to GGUF-loaded Qwen3.5 only (safetensors are
+already grouped).
 
 ---
 
