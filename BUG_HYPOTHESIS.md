@@ -1,7 +1,7 @@
 # Bug Hypothesis: Garbage output from Qwen3.5-35B-A3B Q4_K_M GGUF
 
 **Date:** 2026-07-04 (updated)  
-**Status:** ROOT CAUSE FOUND (2026-07-04) — GGUF stores GDN V-heads in ggml *tiled* order; vLLM expects HF *grouped* order and never converts. See "ROOT CAUSE" section below.  
+**Status:** ✅ **SOLVED (2026-07-04)** — `"The capital of France is"` → `" Paris.\nThe capital of France is Paris.\nThe"`, Paris logprob −0.753 at **rank 1** (was rank ~1303). Fixed via the vllm-gguf-plugin `Qwen3_5GGUFAdapter` + two plugin-core fixes; TP=1, fp16, Q4_K_M. See SOLUTION SUMMARY below.  
 **NOTE (2026-07-03):** Branch merged with upstream/main. `Qwen3_5Model.load_weights` no longer uses a manual `stacked_params_mapping` loop; it now goes through `AutoWeightsLoader` with `hf_to_vllm_mapper` (`orig_to_new_stacked` at `vllm/model_executor/models/qwen3_5.py:203-210`). Same shard ids as before (`in_proj_qkv`→`(0,1,2)`, `in_proj_z`→`3`, `in_proj_b`→`0`, `in_proj_a`→`1`), but the code path is different — see Plan 0.  
 **Symptoms:** Model loads cleanly, inference runs, all outputs are incoherent garbage on both TP=1 and TP=2.  
 Examples: `"The capital of France is"` → `" is"` (top token), `" capital"` (rank 2), `" Cap"` (rank 3) — context-word copying pattern.  
@@ -9,7 +9,120 @@ Paris rank ~1303 vs expected rank ~1.
 
 ---
 
-## SESSION STATUS & NEXT ACTIONS (2026-07-04)
+## SOLUTION SUMMARY (2026-07-04)
+
+The garbage output had **multiple stacked causes**; all are now fixed in the
+vllm-gguf-plugin path (clone `/home/kjelloe/GIT/vllm-gguf-plugin`, mirrored in
+`.venv` site-packages). Result: Paris rank 1, coherent generation.
+
+Correctness fixes (in `weights_adapter/qwen3_5.py` unless noted):
+1. **GDN V-head tiling (the original root cause):** GGUF stores V/Z/b/a/A_log/
+   dt_bias/conv1d-V/out_proj heads in ggml *tiled* order; vLLM expects HF
+   *grouped* order. Undone at load (`_tiled_to_grouped_v_heads`).
+2. **A_log representation:** GGUF stores `-exp(A_log)`; vLLM's GDN expects raw
+   `A_log`. Restored via `log(-x)`. (The old in-tree loader got this wrong —
+   likely a second contributor to the original garbage.)
+3. **RMSNorm +1 contract:** llama.cpp stores text norms as `w+1`; vLLM's
+   GemmaRMSNorm computes `x·(1+w)` and needs raw `w` → subtract 1 on every
+   text norm (incl. q/k norms and final norm), prefix-independent. (The old
+   in-tree branch used plain RMSNorm, which made `w+1` accidentally correct;
+   the upstream merge to GemmaRMSNorm changed the contract.)
+4. **Name mapping:** arch alias `qwen3_5_moe`→`qwen35moe`; text-only forcing
+   (vision_config has `depth`, not `num_hidden_layers`); MoE merged-expert +
+   shared-expert + `ssm_dt.bias` sideload; `language_model.` prefix for the
+   ConditionalGeneration wrapper (keyed on vision_config presence, NOT
+   `config.architectures`, which the GGUF path doesn't populate).
+5. **Tuple shard_id** (`quantization/params.py`): `in_proj_qkvz` loads the
+   combined Q+K+V block via `shard_id=(0,1,2)`; store the GGUF weight-type
+   marker per covered shard instead of routing through the fused loader.
+6. **RoutedExperts MoE materialization** (`quantization/params.py` + adapter):
+   materialize the fused expert param on per-expert 2D packed slices
+   (`(local_num_experts, rows×2-if-w13, packed_cols)`), and expand 3D GGUF
+   expert tensors into per-expert 2D yields in the adapter so they take
+   RoutedExperts' heuristic-free per-expert path (its fused-3D branch applies
+   element-space transpose/chunk that mangles packed bytes). TP=1 only —
+   packed-dim TP sharding deliberately not implemented.
+
+Environment/runtime (not code): `language_model_only=True` (vision tower is
+never loaded from a text-only GGUF; profiling otherwise runs it uninitialized);
+refreshed stale compiled binaries after the upstream merge
+(`VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto`);
+`VLLM_USE_FLASHINFER_SAMPLER=0` (or ninja+PATH for its JIT); memory fit at
+`gpu_memory_utilization=0.93, max_model_len=64, max_num_batched_tokens=64,
+max_num_seqs=1` (weights take 21.14 GiB of 24 GB).
+
+**Remaining follow-ups (checklist):**
+- [ ] **PR submission** (Kjell): `qwen35-gguf-support` branch from the plugin
+      clone; response expected to take days.
+- [x] **TP=2 — DONE (2026-07-04)**: added tp division to the 2D MoE
+      materialization (with quant-block alignment guard). Validated on
+      4090+3090: identical output to TP=1, " Paris" rank 1 (logprob −0.733 vs
+      −0.753 at TP=1, within kernel-reduction noise). Runner:
+      `/tmp/validate_qwen35_tp2.py` (needs `if __name__ == "__main__"` guard —
+      mp spawn re-executes the script).
+- [x] **Quality validation — DONE (2026-07-04)**: (a) 64-token coherence
+      sample on the 3 prompts PASSED — incl. a correct recursive `fibonacci`
+      implementation (real code gen, not recall). (b) `lm_eval arc_easy`
+      (limit=200, TP=1): **acc 0.835 ±0.026**, acc_norm 0.790 (random=0.25) —
+      confirms the quantized MoE+GDN path is numerically sound.
+      NB: lm_eval hardcodes `AutoConfig.from_pretrained(<gguf>)`; drive it via
+      `/tmp/run_lmeval.py` which monkeypatches `.gguf`→HF-repo for config.
+- [ ] **Commit staged vLLM-tree cleanup** on `dev_kjelloe`: the `git rm` of
+      orphaned `gguf_loader.py` / `quantization/gguf.py` is staged but
+      uncommitted.
+- [ ] Optional: promote `/tmp/run.sh` + `/tmp/validate_qwen35_plugin.py` into
+      `debugging/`.
+
+---
+
+## TP=2 PLAN (2026-07-04)
+
+**Goal:** Paris test + coherence at `tensor_parallel_size=2` (4090 + 3090).
+Memory pressure disappears (≈10.6 GiB weights/GPU), so the tight-fit knobs from
+TP=1 can be relaxed.
+
+**Why it's likely small:** the only deliberate TP gap is the 2D MoE
+materialization (skips the tp division). Everything else already row-narrows in
+packed-byte space via `_GGUFParamLoadMixin` / `RoutedExperts._load_w13/_load_w2`,
+and byte-space narrowing is exact whenever `input_elems_per_rank` is a multiple
+of the quant superblock (256 for K-quants, 32 for Q8_0/Q4_0). Alignment audit
+for this model at TP=2 — all pass:
+- w13 (gate/up, Q4_K): sharded along *rows* (512+512 → 256+256/rank) — rows are
+  quantization-independent, always safe.
+- w2 (down, Q6_K): input 512 elems → 256/rank = exactly one superblock =
+  210 bytes/rank of the 420-byte row. Integer ✓.
+- Dense row-parallel (o_proj Q5_K etc.): hidden 2048 → 1024/rank = 4 superblocks ✓.
+- GDN in_proj_qkvz: row-sharded by heads (16K/32V → 8/16 per rank); the V-head
+  reorder runs on the full tensor *before* sharding, and grouped order shards
+  cleanly per rank (num_v_per_k preserved within each rank) ✓.
+- out_proj: force-dequantized to fp16 dense → element-space row-parallel ✓.
+
+**Steps:**
+1. *Static verification (no GPU):* read `_load_w13`/`_load_w2` narrow logic to
+   confirm shard sizes derive from the (sharded) `expert_data` shape — i.e.
+   byte-space consistent; check the fused-MoE kernel derives logical dims from
+   data bytes + weight_type (it must, since TP=1 worked without `tensor_shape`
+   on the materialized MoE params).
+2. *Implement:* in `_materialize_gguf_moe_param` 2D path, divide the sharded
+   dim by `tp_size` (w13: rows after doubling; w2: packed cols) with an
+   alignment assert (`% superblock_bytes == 0`) that raises a clear error for
+   misaligned models instead of corrupting.
+3. *Runner:* TP=2 variant of the validate script — `CUDA_VISIBLE_DEVICES=0,1`,
+   `tensor_parallel_size=2`, drop `VLLM_ENABLE_V1_MULTIPROCESSING=0` (TP=2
+   needs the mp executor), relax memory knobs (gpu_util 0.90, max_model_len
+   512+).
+4. *Validate:* Paris test at TP=2; then TP=1-vs-TP=2 first-token logprob
+   comparison (should match within kernel-reduction noise); then the deferred
+   quality checklist item.
+
+**Known risks:** GDN/mamba state sharding at TP=2 in the plugin path is
+unexercised (old in-tree H5/H6 were TP=2 state-shape bugs — fixed upstream
+since, but unverified via plugin); mixed-arch NCCL (4090+3090) is known-working
+on this rig from earlier in-tree TP=2 runs.
+
+---
+
+## SESSION STATUS & NEXT ACTIONS (2026-07-04, superseded — see SOLUTION SUMMARY)
 
 **Root cause: FOUND and triple-confirmed.** GDN V-head tiling mismatch (see ROOT
 CAUSE section). Confirmed by (1) independent source analysis, (2) closed plugin
