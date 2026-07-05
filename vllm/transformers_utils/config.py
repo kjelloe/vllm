@@ -635,6 +635,7 @@ def maybe_override_with_speculators(
         Tuple of (resolved_model, resolved_tokenizer, speculative_config)
     """
     kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
+    gguf_model_repo = None
     try:
         config_dict, _ = PretrainedConfig.get_config_dict(
             model if gguf_model_repo is None else gguf_model_repo,

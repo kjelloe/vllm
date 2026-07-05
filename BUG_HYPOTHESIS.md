@@ -1,3 +1,100 @@
+# Qwen3-Coder-30B-A3B GGUF-vs-AWQ benchmark comparison (2026-07-05)
+
+**Goal:** compare Qwen3-Coder-30B-A3B-Instruct at ~4-bit across engines on the
+4090+3090 WSL2 rig via the `llm-test-bench` harness (19 coding tasks). Originally
+GGUF-Q4_K_M vs fp8; the fp8 arm proved unrunnable on this hardware, so the
+non-GGUF arm is now **AWQ-Int4**. Status by arm:
+
+| Arm | Status | Detail |
+|---|---|---|
+| **AWQ-Int4** | ✅ **WORKING (2026-07-05)** | `cpatonn/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit`, awq_marlin, TP=2, `enforce_eager`. 18/19 tasks pass at **16.6 tok/s**. |
+| **fp8 (W8A8)** | ❌ **DEAD on this rig (hardware)** | Both block-scaled and dynamic quantize activations to E4M3; 3090 (sm_86) has no `fp8e4nv`. Not fixable in software. |
+| **GGUF-Q4_K_M** | ⛔ **BLOCKED (plugin fused-MoE kernel)** | Loads past name-map; first forward raises `Invalid expert row width 768 for quant type 12: must be divisible by 144`. down_proj-path hypothesis below. |
+
+## AWQ-Int4 arm — confirmed working
+
+`cpatonn/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit` runs clean through `awq_marlin`
+(weight-only Int4, activations fp16 → no E4M3 wall, no mixed-GPU CUTLASS trap).
+TP=2 across 4090+3090, `enforce_eager`, `--max-model-len 8192`,
+`--gpu-memory-utilization 0.88`. **16.6 tok/s** (PCIe TP, eager — not throughput
+representative of a single-GPU or NVLink setup).
+
+Quality: **18/19** llm-test-bench coding tasks pass; the AWQ outputs match GGUF
+Q4_K_M exactly on the 18 non-hashmap tasks. The lone failure, `python_hashmap`,
+returns `TESTS_STILL_FAIL` — **identical** to every stock
+Qwen3-Coder-30B-A3B-Instruct variant tested on llama-server. This confirms the
+hashmap *pass* seen in the 1M-context fine-tune is a **checkpoint difference**,
+not an engine/precision artifact. AWQ-Int4 is therefore a valid quality baseline
+for the GGUF comparison once the GGUF arm unblocks.
+
+## fp8 arm — dead on 4090+3090 (hardware wall, not fixable)
+
+Any **W8A8** fp8 (activations quantized) requires E4M3 (`fp8e4nv`), which needs
+Ada/Hopper sm_89+. The RTX 3090 (Ampere sm_86) only has `fp8e4b15`/`fp8e5`.
+
+- `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8` — **block-scaled** W8A8
+  (block_shape [128,128] → `w8a8_triton_block_scaled_mm`). Worker_TP1 (3090)
+  raises `type fp8e4nv not supported in this architecture`. No Marlin weight-only
+  fallback for block-scaled fp8; 30B needs TP=2 so the 3090 can't be dropped.
+- `BCCard/Qwen3-Coder-30B-A3B-Instruct-FP8-Dynamic` — per-channel weights, but
+  **dynamic per-token activation** fp8 → still E4M3. Loaded, then failed in
+  torch.compile autotune on the 3090 building the fused
+  `…cutlass_scaled_mm…rms_norm` activation-quant kernel. The mixed 4090+3090 TP
+  group selects the CUTLASS fp8 path keyed off the 4090 for both workers; the
+  3090 can't execute it. `--enforce-eager` doesn't help (runtime fp8 error
+  instead of compile error).
+
+The only Ampere-safe fp8 is **weight-only W8A16** (activations unquantized),
+which the mixed setup won't select and which few checkpoints ship. **Conclusion:
+no fp8 arm on this rig** — replaced by AWQ-Int4.
+
+## GGUF-Q4_K_M arm — blocked at plugin fused-MoE kernel
+
+Runs through the `vllm-gguf-plugin` default adapter. Two fixes were needed just
+to reach the first forward (both applied, mirrored clone → site-packages):
+
+1. `--gpu-memory-utilization 0.88` (0.94 fails the startup reservation guard; WSL
+   compositor holds ~1.75 GiB on the 4090, free 22.24/23.99).
+2. `weights_adapter/default.py` qwen2_moe/qwen3_moe branch: added the fused-name
+   sideload regex `experts\.(gate_up_proj|down_proj)`, mirroring the OLMoE
+   branch. Current transformers fuses MoE experts into
+   `mlp.experts.gate_up_proj`/`down_proj`; without it `build_name_map` raises
+   "Failed to map GGUF parameters" for all 48 `gate_up_proj`. This is a general
+   plugin gap (every qwen3_moe GGUF) — folded into the plugin follow-up.
+
+**The blocker (first forward, profile_run):**
+`ValueError: Invalid expert row width 768 for quant type 12: must be divisible
+by 144` (`vllm_gguf_plugin/triton/fused_moe/utils.py:188 _validate_args`). quant
+type 12 = Q4_K (144 B / 256 elems). 768 = Qwen3-Coder's `moe_intermediate_size`
+= the down_proj (w2) reduction-axis **element** count. The kernel expects that
+axis as a **packed-byte** width (768 elems → 432 packed bytes, 144-divisible) but
+receives raw 768. Same class as OLMoE's `1024 must be divisible by 210` (Q6_K),
+but here on **w2/down** rather than gate/up.
+
+**Hypothesis (down_proj-path asymmetry):** `down_proj` maps via gguf-py straight
+to the fused `mlp.experts.down_proj` name (the tensor-map loop at
+`default.py:218-221` overwrites the manual per-expert alias set at
+`default.py:84-86`), while `gate_up_proj` (no single GGUF tensor) stays on the
+per-expert alias and takes the RoutedExperts per-expert 2D path. That split hands
+w2 to the kernel with the element-count axis where the packed-byte axis belongs.
+
+**Fix to attempt:** make `find_hf_name_in_tensor_map` (`default.py:194`) return
+`None` for the fused `mlp.experts.down_proj` under qwen3_moe, so the manual
+per-expert alias survives and down_proj takes the **same** per-expert path as
+gate/up (already covered by the sideload regex above). Goal: consistent packed
+orientation for all three projections through the RoutedExperts per-expert path.
+
+**Risks:** iterative (~90 s/load); if it loads it may produce **silently wrong**
+output rather than a clean error — MUST validate correctness (greedy "capital of
+France", ideally an lm_eval slice) before trusting any benchmark numbers, exactly
+like the Qwen3.5 validation gauntlet. Genuinely plugin/kernel territory; treat as
+exploratory. Tracked in the plugin clone's `issue-routed-experts-gguf.md`.
+
+**Also noted (unrelated, cosmetic):** llm-test-bench `run.sh` line 15 bash bug
+(`[[: 08: value too great for base` — leading-zero clock value parsed as octal).
+
+---
+
 # Bug Hypothesis: Garbage output from Qwen3.5-35B-A3B Q4_K_M GGUF
 
 **Date:** 2026-07-04 (updated)  
@@ -67,6 +164,16 @@ max_num_seqs=1` (weights take 21.14 GiB of 24 GB).
       confirms the quantized MoE+GDN path is numerically sound.
       NB: lm_eval hardcodes `AutoConfig.from_pretrained(<gguf>)`; drive it via
       `/tmp/run_lmeval.py` which monkeypatches `.gguf`→HF-repo for config.
+- [x] **Regression check — DONE (2026-07-05)**: not a regression. Qwen3-0.6B
+      (dense Q8_0) generates fine. OLMoE (Q6_K MoE) is ALREADY broken on
+      pristine plugin main (same RoutedExperts materialization `IndexError`);
+      my fix advances it past load, where it hits a *separate* Q6_K layout
+      issue: OLMoE stores gate/up **transposed** (`[packed_bytes, rows]`,
+      per-expert `w1=(840,1024)`) vs down (`[rows, packed_bytes]`), so the
+      fused-MoE kernel rejects w1's non-block-aligned last dim (1024 % 210).
+      Qwen3.5 (Q4_K, `[rows, packed_bytes]`) is unaffected. Documented in the
+      plugin `issue-routed-experts-gguf.md` follow-up. Fix is maintainer/
+      kernel-layout territory (can't plain-transpose packed bytes).
 - [ ] **Commit staged vLLM-tree cleanup** on `dev_kjelloe`: the `git rm` of
       orphaned `gguf_loader.py` / `quantization/gguf.py` is staged but
       uncommitted.
