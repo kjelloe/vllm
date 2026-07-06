@@ -9,7 +9,17 @@ non-GGUF arm is now **AWQ-Int4**. Status by arm:
 |---|---|---|
 | **AWQ-Int4** | ✅ **WORKING (2026-07-05)** | `cpatonn/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit`, awq_marlin, TP=2, `enforce_eager`. 18/19 tasks pass at **16.6 tok/s**. |
 | **fp8 (W8A8)** | ❌ **DEAD on this rig (hardware)** | Both block-scaled and dynamic quantize activations to E4M3; 3090 (sm_86) has no `fp8e4nv`. Not fixable in software. |
-| **GGUF-Q4_K_M** | ⛔ **BLOCKED (plugin fused-MoE kernel)** | Loads past name-map; first forward raises `Invalid expert row width 768 for quant type 12: must be divisible by 144`. down_proj-path hypothesis below. |
+| **GGUF-Q4_K_M** | ✅ **WORKING + benchmarked (2026-07-06)** | Fixed by expanding 3D fused experts → per-expert 2D in the default adapter. **31.2 tok/s** (TP=1, single 4090), **15/16** eligible tasks pass. Coherent. |
+
+**Final comparison (TP=1, single RTX 4090):** GGUF-Q4_K_M **31.2 tok/s** vs
+AWQ-Int4 **28.5 tok/s** — GGUF ~10% faster single-request (no Marlin overhead, no
+enforce_eager needed). Same 15/16 pass; `python_hashmap` fails on **both** =
+base-model capability gap, not a format artifact. **The 4× gap vs llama-server
+(115 tok/s) persists on both vLLM paths → it is engine-level, not format.**
+vLLM only wins under concurrent load; llama-server wins single-request. Deployment
+note: GGUF's dequant workspace (~5 GB) vs AWQ Marlin (~1.5 GB) caps KV at ~13760
+tokens on 24 GB, so GGUF ran at `max_model_len=8192` (3 tasks SKIPPED_CTX,
+needed 16384+).
 
 ## AWQ-Int4 arm — confirmed working
 
@@ -48,10 +58,10 @@ The only Ampere-safe fp8 is **weight-only W8A16** (activations unquantized),
 which the mixed setup won't select and which few checkpoints ship. **Conclusion:
 no fp8 arm on this rig** — replaced by AWQ-Int4.
 
-## GGUF-Q4_K_M arm — blocked at plugin fused-MoE kernel
+## GGUF-Q4_K_M arm — fixed (default adapter expert expansion)
 
-Runs through the `vllm-gguf-plugin` default adapter. Two fixes were needed just
-to reach the first forward (both applied, mirrored clone → site-packages):
+Runs through the `vllm-gguf-plugin` default adapter. Three fixes total (all
+applied, mirrored clone → site-packages):
 
 1. `--gpu-memory-utilization 0.88` (0.94 fails the startup reservation guard; WSL
    compositor holds ~1.75 GiB on the 4090, free 22.24/23.99).
@@ -59,36 +69,51 @@ to reach the first forward (both applied, mirrored clone → site-packages):
    sideload regex `experts\.(gate_up_proj|down_proj)`, mirroring the OLMoE
    branch. Current transformers fuses MoE experts into
    `mlp.experts.gate_up_proj`/`down_proj`; without it `build_name_map` raises
-   "Failed to map GGUF parameters" for all 48 `gate_up_proj`. This is a general
-   plugin gap (every qwen3_moe GGUF) — folded into the plugin follow-up.
+   "Failed to map GGUF parameters" for all 48 `gate_up_proj`.
+3. **The real fix** — `default.py` `map_weights`: expand 3D fused expert tensors
+   into per-expert 2D yields (same as the Qwen3.5 adapter already did).
 
-**The blocker (first forward, profile_run):**
+**The blocker (first forward, profile_run) was:**
 `ValueError: Invalid expert row width 768 for quant type 12: must be divisible
-by 144` (`vllm_gguf_plugin/triton/fused_moe/utils.py:188 _validate_args`). quant
-type 12 = Q4_K (144 B / 256 elems). 768 = Qwen3-Coder's `moe_intermediate_size`
-= the down_proj (w2) reduction-axis **element** count. The kernel expects that
-axis as a **packed-byte** width (768 elems → 432 packed bytes, 144-divisible) but
-receives raw 768. Same class as OLMoE's `1024 must be divisible by 210` (Q6_K),
-but here on **w2/down** rather than gate/up.
+by 144` (`fused_moe/utils.py:188 _validate_args`), on the **first** `ggml_moe_a8`
+call = **w1/gate_up** (Q4_K, type 12), NOT down_proj.
 
-**Hypothesis (down_proj-path asymmetry):** `down_proj` maps via gguf-py straight
-to the fused `mlp.experts.down_proj` name (the tensor-map loop at
-`default.py:218-221` overwrites the manual per-expert alias set at
-`default.py:84-86`), while `gate_up_proj` (no single GGUF tensor) stays on the
-per-expert alias and takes the RoutedExperts per-expert 2D path. That split hands
-w2 to the kernel with the element-count axis where the packed-byte axis belongs.
+**Actual root cause (the earlier down_proj hypothesis was WRONG).** The default
+adapter yielded the GGUF expert tensors as **3D** (`[E, rows, packed]`). vLLM's
+`RoutedExperts.load_weights` treats any 3D tensor as `is_fused=True` and applies
+element-space heuristics meant for HF-style fused gate_up — `transpose(-1,-2)`
+when `shape[-1] != unpadded_hidden`, then `chunk(2, dim=1)` — on the **packed
+GGUF bytes**. GGUF stores gate/up as *separate* tensors and packs along the
+reduction axis, so both the transpose and the chunk are invalid: they left w1
+with `packed_cols = 768` (= `moe_intermediate_size`, the output-row count) where
+the kernel expects the packed hidden width (1152). Ground-truth ggml `ne`
+(per-expert): gate/up `[768, 2048]` Q4_K → packs to `[768, 1152]`; down
+`[2048, 768]` Q6_K → `[2048, 630]`.
 
-**Fix to attempt:** make `find_hf_name_in_tensor_map` (`default.py:194`) return
-`None` for the fused `mlp.experts.down_proj` under qwen3_moe, so the manual
-per-expert alias survives and down_proj takes the **same** per-expert path as
-gate/up (already covered by the sideload regex above). Goal: consistent packed
-orientation for all three projections through the RoutedExperts per-expert path.
+The name-map patch (forcing down_proj off the fused alias) was a **no-op** — the
+error was identical — which falsified the down_proj-path hypothesis: down was
+already on the per-expert path, and the failing tensor was gate/up all along.
 
-**Risks:** iterative (~90 s/load); if it loads it may produce **silently wrong**
-output rather than a clean error — MUST validate correctness (greedy "capital of
-France", ideally an lm_eval slice) before trusting any benchmark numbers, exactly
-like the Qwen3.5 validation gauntlet. Genuinely plugin/kernel territory; treat as
-exploratory. Tracked in the plugin clone's `issue-routed-experts-gguf.md`.
+**Fix (applied):** in `default.py` `map_weights`, when an expert tensor arrives
+3D (`".mlp.experts.0." in hf_name and weight.dim() == 3`), unbind it into
+per-expert 2D yields (`.experts.{eid}.`). RoutedExperts then takes the
+heuristic-free 2D per-expert path; the plugin's `_materialize_gguf_moe_param` 2D
+branch builds `[E, 1536, 1152]` (gate/up, `1152 % 144 == 0`) and `[E, 2048, 630]`
+(down, `630 % 210 == 0`). This is the same expansion the Qwen3.5 adapter carries;
+porting it to the default adapter fixes every qwen*_moe (and likely deepseek/
+olmoe) GGUF on current transformers+RoutedExperts. Fold into the plugin PR.
+
+**Validation:** greedy "The capital of France is" →
+`" Paris. The capital of Belgium is Brussels"` (coherent, no context-copying).
+Full benchmark-quality comparison vs AWQ still pending (a mis-repack could load
+and smoke-test clean yet be subtly wrong — hold the same bar as Qwen3.5).
+
+**Runtime gotchas hit along the way:** `--served-model-name` colon form works
+(`qwen3-coder:30b-gguf`); FlashInfer sampler JIT needs `ninja` on PATH (it's in
+`.venv/bin` but absolute-path `vllm` invocation doesn't export it → prefix
+`PATH=/…/.venv/bin:$PATH`); a stale bare `vllm serve` (defaults to Qwen3-0.6B)
+squatting on `:8000` masqueraded as the GGUF server — always verify `/v1/models`
+`id` before probing.
 
 **Also noted (unrelated, cosmetic):** llm-test-bench `run.sh` line 15 bash bug
 (`[[: 08: value too great for base` — leading-zero clock value parsed as octal).
